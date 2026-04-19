@@ -1,6 +1,5 @@
 # 💼 Safe Xerox Owner: Modernize Your Print Shop
 
-![Owner Dashboard](file:///C:/Users/Hello/.gemini/antigravity/brain/2da61f22-257d-4a97-a06c-743ef886b60b/owner_dashboard_visual_1776598589634.png)
 
 ## 🌟 The "Smart Shop" Upgrade
 In an era where data privacy is everything, traditional Xerox shops are often seen as "security risks." Customers are increasingly hesitant to share files via WhatsApp or Email. 
