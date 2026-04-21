@@ -32,33 +32,23 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
 
   void _initRequestsStream() {
     final user = Supabase.instance.client.auth.currentUser;
-    if (user == null) {
-      debugPrint('STREAM ERROR: No user logged in');
-      return;
-    }
+    if (user == null) return;
     
-    debugPrint('STREAM STARTING: Listening for shop_id: ${user.id}');
-
     _streamSubscription = Supabase.instance.client
         .from('print_requests')
         .stream(primaryKey: ['id'])
         .eq('shop_id', user.id)
         .order('created_at')
         .listen((data) {
-          debugPrint('STREAM UPDATE: Received ${data.length} requests');
-          
           if (data.length > _requests.length && _requests.isNotEmpty) {
             _showNewRequestPing();
           }
-          
           if (mounted) {
             setState(() {
               _requests = List<Map<String, dynamic>>.from(data)
                 ..sort((a, b) => b['created_at'].compareTo(a['created_at']));
             });
           }
-        }, onError: (error) {
-          debugPrint('STREAM FATAL ERROR: $error');
         });
   }
 
@@ -69,12 +59,11 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
           children: [
             Icon(Icons.notifications_active, color: Colors.white),
             SizedBox(width: 12),
-            Text('New Print Request Received!', style: TextStyle(fontWeight: FontWeight.bold)),
+            Text('New Print Request!', style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         backgroundColor: Colors.green,
         behavior: SnackBarBehavior.floating,
-        duration: Duration(seconds: 3),
       ),
     );
   }
@@ -97,10 +86,22 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
     }
   }
 
+  Map<String, List<Map<String, dynamic>>> _getGroupedRequests() {
+    Map<String, List<Map<String, dynamic>>> grouped = {};
+    for (var request in _requests) {
+      String name = request['customer_name'] ?? 'Anonymous';
+      if (!grouped.containsKey(name)) {
+        grouped[name] = [];
+      }
+      grouped[name]!.add(request);
+    }
+    return grouped;
+  }
+
   void _showQrDialog(BuildContext context) {
     final user = Supabase.instance.client.auth.currentUser;
     if (user == null) return;
-    final qrData = 'safexerox://shop?id=${user.id}&name=$_ownerName';
+    final qrData = 'https://safe-xerox-customer.vercel.app/connect?id=${user.id}&name=$_ownerName';
 
     showDialog(
       context: context,
@@ -118,23 +119,16 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
                 const SizedBox(width: 8),
                 IconButton(
                   onPressed: () => _printQrCode(qrData),
-                  icon: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(color: const Color(0xFF1B5E20).withOpacity(0.1), shape: BoxShape.circle),
-                    child: const Icon(Icons.print, color: Color(0xFF1B5E20), size: 20),
-                  ),
+                  icon: const Icon(Icons.print, color: Color(0xFF1B5E20)),
                 ),
               ],
             ),
             const SizedBox(height: 32),
-            SizedBox(
-              width: 200, height: 200,
-              child: QrImageView(data: qrData, version: QrVersions.auto, size: 200.0, foregroundColor: const Color(0xFF1B5E20)),
-            ),
+            SizedBox(width: 200, height: 200, child: QrImageView(data: qrData, version: QrVersions.auto, size: 200.0, foregroundColor: const Color(0xFF1B5E20))),
             const SizedBox(height: 24),
             Text(_ownerName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
             const SizedBox(height: 16),
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close', style: TextStyle(color: Colors.grey))),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
           ],
         ),
       ),
@@ -155,98 +149,49 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
 
   Future<void> _printUploadedFile(String url, String fileName) async {
     try {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Preparing document for printing...')));
-      
       final fileResponse = await http.get(Uri.parse(url));
       final bytes = fileResponse.bodyBytes;
-      
       final String extension = fileName.toLowerCase();
-      final bool isImage = extension.endsWith('.jpg') || 
-                           extension.endsWith('.jpeg') || 
-                           extension.endsWith('.png');
+      final bool isImage = extension.endsWith('.jpg') || extension.endsWith('.jpeg') || extension.endsWith('.png');
 
       Uint8List printBytes;
-
       if (isImage) {
-        // Wrap image in a PDF
         final doc = pw.Document();
         final image = pw.MemoryImage(bytes);
-        
-        doc.addPage(
-          pw.Page(
-            pageFormat: PdfPageFormat.a4,
-            build: (pw.Context context) {
-              return pw.Center(
-                child: pw.Image(image, fit: pw.BoxFit.contain),
-              );
-            },
-          ),
-        );
+        doc.addPage(pw.Page(pageFormat: PdfPageFormat.a4, build: (pw.Context context) => pw.Center(child: pw.Image(image, fit: pw.BoxFit.contain))));
         printBytes = await doc.save();
       } else {
-        // It's already a PDF
         printBytes = bytes;
       }
-
-      await Printing.layoutPdf(
-        onLayout: (format) async => printBytes,
-        name: fileName,
-      );
+      await Printing.layoutPdf(onLayout: (format) async => printBytes, name: fileName);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not print: $e'), backgroundColor: Colors.red),
-        );
-      }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
     }
   }
 
   Future<void> _deleteRequest(Map<String, dynamic> request) async {
     try {
-      // Optimistic UI Update: Remove from screen immediately
-      if (mounted) {
-        setState(() {
-          _requests.removeWhere((item) => item['id'] == request['id']);
-        });
-      }
-
-      // 1. Delete from Storage
       final fileUrl = request['file_url'] as String;
-      final uri = Uri.parse(fileUrl);
-      final fileName = uri.pathSegments.last;
-      final shopId = request['shop_id'];
-      final storagePath = 'uploads/$shopId/$fileName';
-
-      await Supabase.instance.client.storage
-          .from('print-files')
-          .remove([storagePath]);
-
-      // 2. Delete from Database
-      await Supabase.instance.client
-          .from('print_requests')
-          .delete()
-          .eq('id', request['id']);
-
-      // No need to fetch manually, the Stream handles it
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Request and file deleted permanently')),
-        );
-      }
+      final fileName = Uri.parse(fileUrl).pathSegments.last;
+      await Supabase.instance.client.storage.from('print-files').remove(['uploads/${request['shop_id']}/$fileName']);
+      await Supabase.instance.client.from('print_requests').delete().eq('id', request['id']);
     } catch (e) {
-      debugPrint('Error deleting request: $e');
+      debugPrint('Error deleting: $e');
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final groupedRequests = _getGroupedRequests();
+    final customerNames = groupedRequests.keys.toList();
+
     return Scaffold(
       backgroundColor: Colors.grey[50],
       appBar: AppBar(
         backgroundColor: Colors.white, elevation: 0,
         title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Safe Xerox Partner', style: GoogleFonts.poppins(fontWeight: FontWeight.bold, color: const Color(0xFF1B5E20), fontSize: 20)),
-          Text(_ownerName, style: GoogleFonts.poppins(fontSize: 14, color: Colors.grey[600])),
+          Text('Safe Xerox Partner', style: GoogleFonts.poppins(fontWeight: FontWeight.bold, color: const Color(0xFF1B5E20))),
+          Text(_ownerName, style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey)),
         ]),
         actions: [
           IconButton(onPressed: () => _showQrDialog(context), icon: const Icon(Icons.qr_code, color: Color(0xFF1B5E20))),
@@ -257,49 +202,48 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
         ],
       ),
       body: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(16),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text('Requests', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-              TextButton(
-                onPressed: _initRequestsStream,
-                child: const Text('Refresh', style: TextStyle(color: Color(0xFF1B5E20))),
-              ),
-            ],
-          ),
+          const Text('Customer Print Requests', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
           Expanded(
             child: _requests.isEmpty 
               ? const Center(child: Text('No requests yet'))
               : ListView.builder(
-                  itemCount: _requests.length,
+                  itemCount: customerNames.length,
                   itemBuilder: (context, index) {
-                    final request = _requests[index];
-                    final time = DateTime.parse(request['created_at']);
+                    final name = customerNames[index];
+                    final files = groupedRequests[name]!;
                     return Card(
-                      child: ListTile(
-                        leading: const Icon(Icons.description_outlined, color: Color(0xFF1B5E20)),
-                        title: Text(request['file_name'] ?? 'Document'),
-                        subtitle: Text('Sent at ${DateFormat('hh:mm a').format(time.toLocal())}'),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.print, color: Color(0xFF1B5E20)),
-                              onPressed: () => _printUploadedFile(
-                                request['file_url'],
-                                request['file_name'] ?? 'document',
+                      margin: const EdgeInsets.only(bottom: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      child: Theme(
+                        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                        child: ExpansionTile(
+                          leading: CircleAvatar(
+                            backgroundColor: const Color(0xFF1B5E20).withOpacity(0.1),
+                            child: const Icon(Icons.person, color: Color(0xFF1B5E20)),
+                          ),
+                          title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                          subtitle: Text(
+                            '${files.length} ${files.length == 1 ? 'file' : 'files'} uploaded',
+                            style: TextStyle(color: Colors.grey[600]),
+                          ),
+                          children: files.map((file) {
+                            final time = DateTime.parse(file['created_at']);
+                            return ListTile(
+                              leading: const Icon(Icons.description_outlined),
+                              title: Text(file['file_name'] ?? 'File'),
+                              subtitle: Text(DateFormat('hh:mm a').format(time.toLocal())),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(icon: const Icon(Icons.print, color: Color(0xFF1B5E20)), onPressed: () => _printUploadedFile(file['file_url'], file['file_name'])),
+                                  IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _deleteRequest(file)),
+                                ],
                               ),
-                              tooltip: 'Print File',
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.delete_outline, color: Colors.red),
-                              onPressed: () => _deleteRequest(request),
-                              tooltip: 'Delete Permanently',
-                            ),
-                          ],
+                            );
+                          }).toList(),
                         ),
                       ),
                     );
