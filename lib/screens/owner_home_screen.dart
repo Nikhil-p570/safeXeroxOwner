@@ -22,6 +22,7 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
   String _ownerName = 'Loading...';
   List<Map<String, dynamic>> _requests = [];
   StreamSubscription<List<Map<String, dynamic>>>? _streamSubscription;
+  bool _isProfileCheckDone = false;
 
   @override
   void initState() {
@@ -34,6 +35,7 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
     final user = Supabase.instance.client.auth.currentUser;
     if (user == null) return;
     
+    _streamSubscription?.cancel();
     _streamSubscription = Supabase.instance.client
         .from('print_requests')
         .stream(primaryKey: ['id'])
@@ -79,21 +81,87 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
     if (user != null) {
       try {
         final data = await Supabase.instance.client.from('profiles').select().eq('id', user.id).single();
-        if (mounted) setState(() => _ownerName = data['full_name'] ?? 'Owner');
+        if (mounted) {
+          setState(() {
+            _ownerName = data['full_name'] ?? 'Owner';
+            _isProfileCheckDone = true;
+          });
+          
+          // If name is just "Owner" or empty, force setup
+          if (_ownerName == 'Owner' || _ownerName.trim().isEmpty) {
+            _showMandatorySetup();
+          }
+        }
       } catch (e) {
-        if (mounted) setState(() => _ownerName = user.email?.split('@')[0] ?? 'Owner');
+        // No profile record found
+        if (mounted) {
+          setState(() => _isProfileCheckDone = true);
+          _showMandatorySetup();
+        }
       }
     }
+  }
+
+  void _showMandatorySetup() {
+    final nameController = TextEditingController();
+    showDialog(
+      context: context,
+      barrierDismissible: false, // Cannot close it!
+      builder: (context) => AlertDialog(
+        title: const Text('Welcome! Set up your Shop', style: TextStyle(fontWeight: FontWeight.bold)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Please enter your Shop Name or Full Name. This will be shown to customers when they scan your QR.'),
+            const SizedBox(height: 20),
+            TextField(
+              controller: nameController,
+              decoration: InputDecoration(
+                labelText: 'Shop Name',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                prefixIcon: const Icon(Icons.store),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () async {
+              if (nameController.text.trim().isEmpty) return;
+              final user = Supabase.instance.client.auth.currentUser;
+              if (user == null) return;
+
+              try {
+                await Supabase.instance.client.from('profiles').upsert({
+                  'id': user.id,
+                  'full_name': nameController.text.trim(),
+                  'email': user.email,
+                });
+                if (mounted) {
+                  setState(() => _ownerName = nameController.text.trim());
+                  Navigator.pop(context);
+                }
+              } catch (e) {
+                debugPrint('Error saving name: $e');
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1B5E20), foregroundColor: Colors.white),
+            child: const Text('Finish Setup'),
+          ),
+        ],
+      ),
+    );
   }
 
   Map<String, List<Map<String, dynamic>>> _getGroupedRequests() {
     Map<String, List<Map<String, dynamic>>> grouped = {};
     for (var request in _requests) {
-      String name = request['customer_name'] ?? 'Anonymous';
-      if (!grouped.containsKey(name)) {
-        grouped[name] = [];
+      // Use customer_id for unique grouping, fallback to name for older requests
+      String key = request['customer_id'] ?? request['customer_name'] ?? 'Anonymous';
+      if (!grouped.containsKey(key)) {
+        grouped[key] = [];
       }
-      grouped[name]!.add(request);
+      grouped[key]!.add(request);
     }
     return grouped;
   }
@@ -194,6 +262,14 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
           Text(_ownerName, style: GoogleFonts.poppins(fontSize: 12, color: Colors.grey)),
         ]),
         actions: [
+          IconButton(
+            onPressed: () {
+              _initRequestsStream();
+              _fetchProfile();
+            },
+            icon: const Icon(Icons.refresh, color: Color(0xFF1B5E20)),
+            tooltip: 'Refresh',
+          ),
           IconButton(onPressed: () => _showQrDialog(context), icon: const Icon(Icons.qr_code, color: Color(0xFF1B5E20))),
           IconButton(onPressed: () async {
             await Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfilePage()));
@@ -207,48 +283,61 @@ class _OwnerHomeScreenState extends State<OwnerHomeScreen> {
           const Text('Customer Print Requests', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
           Expanded(
-            child: _requests.isEmpty 
-              ? const Center(child: Text('No requests yet'))
-              : ListView.builder(
-                  itemCount: customerNames.length,
-                  itemBuilder: (context, index) {
-                    final name = customerNames[index];
-                    final files = groupedRequests[name]!;
-                    return Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                      child: Theme(
-                        data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
-                        child: ExpansionTile(
-                          leading: CircleAvatar(
-                            backgroundColor: const Color(0xFF1B5E20).withOpacity(0.1),
-                            child: const Icon(Icons.person, color: Color(0xFF1B5E20)),
+            child: RefreshIndicator(
+              onRefresh: () async {
+                _initRequestsStream();
+                await _fetchProfile();
+              },
+              color: const Color(0xFF1B5E20),
+              child: _requests.isEmpty 
+                ? ListView( // Using ListView so RefreshIndicator works even when empty
+                    children: [
+                      SizedBox(height: MediaQuery.of(context).size.height * 0.3),
+                      const Center(child: Text('No requests yet')),
+                    ],
+                  )
+                : ListView.builder(
+                    itemCount: customerNames.length,
+                    itemBuilder: (context, index) {
+                      final key = customerNames[index];
+                      final files = groupedRequests[key]!;
+                      final name = files.first['customer_name'] ?? 'Anonymous';
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                        child: Theme(
+                          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                          child: ExpansionTile(
+                            leading: CircleAvatar(
+                              backgroundColor: const Color(0xFF1B5E20).withOpacity(0.1),
+                              child: const Icon(Icons.person, color: Color(0xFF1B5E20)),
+                            ),
+                            title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                            subtitle: Text(
+                              '${files.length} ${files.length == 1 ? 'file' : 'files'} uploaded',
+                              style: TextStyle(color: Colors.grey[600]),
+                            ),
+                            children: files.map((file) {
+                              final time = DateTime.parse(file['created_at']);
+                              return ListTile(
+                                leading: const Icon(Icons.description_outlined),
+                                title: Text(file['file_name'] ?? 'File'),
+                                subtitle: Text(DateFormat('hh:mm a').format(time.toLocal())),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(icon: const Icon(Icons.print, color: Color(0xFF1B5E20)), onPressed: () => _printUploadedFile(file['file_url'], file['file_name'])),
+                                    IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _deleteRequest(file)),
+                                  ],
+                                ),
+                              );
+                            }).toList(),
                           ),
-                          title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-                          subtitle: Text(
-                            '${files.length} ${files.length == 1 ? 'file' : 'files'} uploaded',
-                            style: TextStyle(color: Colors.grey[600]),
-                          ),
-                          children: files.map((file) {
-                            final time = DateTime.parse(file['created_at']);
-                            return ListTile(
-                              leading: const Icon(Icons.description_outlined),
-                              title: Text(file['file_name'] ?? 'File'),
-                              subtitle: Text(DateFormat('hh:mm a').format(time.toLocal())),
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  IconButton(icon: const Icon(Icons.print, color: Color(0xFF1B5E20)), onPressed: () => _printUploadedFile(file['file_url'], file['file_name'])),
-                                  IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _deleteRequest(file)),
-                                ],
-                              ),
-                            );
-                          }).toList(),
                         ),
-                      ),
-                    );
-                  },
-                ),
+                      );
+                    },
+                  ),
+            ),
           ),
         ]),
       ),
